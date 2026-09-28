@@ -205,14 +205,21 @@ function withExitSpy() {
 
 type Setup = Awaited<ReturnType<typeof testRender>>;
 let setup: Setup;
+let restoreFetch: () => void;
 
 beforeEach(() => {
+  // Startup hydration and selection broadcasts must not read or change the
+  // developer's daemon. Tests needing daemon data override this empty reply.
+  const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(
+    Object.assign(async () => Response.json({}), { preconnect: () => {} }),
+  );
+  restoreFetch = () => fetchSpy.mockRestore();
   sseCallbacks = null;
   switchToPaneSpy.mockClear();
   switchToPaneSpy.mockImplementation(async (_target: string) => true);
   sendKeysSpy.mockClear();
   sendKeysSpy.mockImplementation(async () => true);
-  flashPaneSpy.mockClear();
+  flashPaneSpy.mockReset();
   flashPaneDetachedSpy.mockClear();
   notifyActivePaneSpy.mockClear();
   isPaneInCurrentWindowSpy.mockClear();
@@ -240,6 +247,7 @@ beforeEach(() => {
 
 afterEach(() => {
   setup?.renderer.destroy();
+  restoreFetch();
   // refreshServerInfo writes the module-global server-guard cache; restore
   // fail-open so a guard test's refusal can't leak into other test files.
   setDaemonSocketPath(null);
@@ -1133,14 +1141,16 @@ describe("App sidebar mode", () => {
     flashPaneSpy.mockClear();
     isPaneInCurrentWindowSpy.mockClear();
 
-    // Rapid navigation: j then j again within the debounce window
-    setup.mockInput.pressKey("j");
-    await setup.renderOnce();
-    setup.mockInput.pressKey("j");
-    await setup.renderOnce();
+    const flashed = new Promise<void>((resolve) => {
+      flashPaneSpy.mockImplementationOnce(() => resolve());
+    });
 
-    // Wait for debounce to fire
-    await new Promise((r) => setTimeout(r, 100));
+    // Deliver one burst without yielding to hydration or debounce timers
+    // between keys; rendering speed must not decide whether input is rapid.
+    setup.mockInput.pressKey("j");
+    setup.mockInput.pressKey("j");
+
+    await flashed;
 
     // Should only flash the final destination pane, not intermediate ones
     expect(flashPaneSpy).toHaveBeenCalledTimes(1);
@@ -1232,6 +1242,49 @@ describe("App sidebar mode", () => {
     const betaLine = lines.find((l: string) => l.includes("beta"));
     expect(betaLine).toBeDefined();
   });
+});
+
+describe("App waiting-row group movement", () => {
+  for (const hasSibling of [false, true]) {
+    it.each([
+      ["J", ["alpha", "charlie", "beta"]],
+      ["K", ["beta", "alpha"]],
+      ["<", ["beta", "alpha"]],
+      [">", ["alpha", "charlie", "beta"]],
+    ] as const)(
+      `%s moves the original group (visible sibling: ${hasSibling})`,
+      async (key, pins) => {
+        await renderApp(120, 24, { groupBy: "project" });
+        sseCallbacks!.onInit(
+          [
+            mockEnrichedSession({ id: "a", project: "alpha" }),
+            mockEnrichedSession({
+              id: "b",
+              project: "beta",
+              status: "waiting",
+            }),
+            mockEnrichedSession({ id: "c", project: "charlie" }),
+            ...(hasSibling
+              ? [mockEnrichedSession({ id: "b2", project: "beta" })]
+              : []),
+          ],
+          null,
+        );
+        await setup.renderOnce();
+        for (const press of ["g", "g", "j", key]) {
+          setup.mockInput.pressKey(press);
+          await setup.renderOnce();
+        }
+        await Bun.sleep(350);
+        expect(uiStateWrites).toContainEqual({ pinnedGroups: [...pins] });
+        // Cursor stays on the waiting session: x still names a single session.
+        setup.mockInput.pressKey("x");
+        await setup.renderOnce();
+        expect(setup.captureCharFrame()).toContain("Kill Session?");
+        expect(setup.captureCharFrame()).not.toContain("Kill Group?");
+      },
+    );
+  }
 });
 
 describe("App kill/restart dispatch routing", () => {
@@ -1430,6 +1483,137 @@ describe("App kill/restart dispatch routing", () => {
       expect(
         calls.some((c) => c.url.includes("/sessions/claude_sess/kill")),
       ).toBe(false);
+    } finally {
+      restore();
+    }
+  });
+
+  it("refuses band bulk-kill after collapse-all but still kills an individual waiting row", async () => {
+    const { calls, restore } = captureFetch();
+    try {
+      await renderApp(120, 24, { groupBy: "project" });
+      sseCallbacks!.onInit(
+        [
+          mockEnrichedSession({
+            id: "a",
+            project: "alpha",
+            status: "waiting",
+            tmuxPane: "%1",
+          }),
+          mockEnrichedSession({
+            id: "b",
+            project: "beta",
+            status: "waiting",
+            tmuxPane: "%2",
+          }),
+        ],
+        null,
+      );
+      await setup.renderOnce();
+      for (const key of ["g", "g", "z", "m", "x"]) {
+        setup.mockInput.pressKey(key);
+        await setup.renderOnce();
+      }
+      expect(setup.captureCharFrame()).not.toContain("Kill Group?");
+      expect(calls.some((c) => c.url.endsWith("/kill"))).toBe(false);
+      setup.mockInput.pressKey("m");
+      await setup.renderOnce();
+      expect(setup.captureCharFrame()).not.toContain("Kill group");
+      expect(setup.captureCharFrame()).not.toContain("New session");
+      expect(setup.captureCharFrame()).not.toContain("Worktrees");
+      for (const key of ["j", "x"]) {
+        setup.mockInput.pressKey(key);
+        await setup.renderOnce();
+      }
+      expect(setup.captureCharFrame()).toContain("Kill Session?");
+      setup.mockInput.pressKey("y");
+      await setup.renderOnce();
+      expect(
+        calls
+          .filter((c) => c.url.endsWith("/kill"))
+          .map((c) => c.url.split("/sessions/")[1]),
+      ).toEqual(["a/kill"]);
+    } finally {
+      restore();
+    }
+  });
+
+  it("keeps the flat list's sessions header inert: x, the menu, and Enter reach no group action", async () => {
+    const { calls, restore } = captureFetch();
+    try {
+      await renderApp(120, 24, { groupBy: "none" });
+      sseCallbacks!.onInit(
+        [
+          mockEnrichedSession({ id: "a", status: "waiting", tmuxPane: "%1" }),
+          mockEnrichedSession({ id: "b", status: "working", tmuxPane: "%2" }),
+          mockEnrichedSession({ id: "c", status: "idle", tmuxPane: "%3" }),
+        ],
+        null,
+      );
+      await setup.renderOnce();
+      expect(setup.captureCharFrame()).toContain("sessions (2)");
+      // band header, a, sessions header
+      for (const key of ["g", "g", "j", "j", "x"]) {
+        setup.mockInput.pressKey(key);
+        await setup.renderOnce();
+      }
+      let frame = setup.captureCharFrame();
+      expect(frame).not.toContain("Kill Group?");
+      expect(frame).not.toContain("Kill Session?");
+      expect(frame).not.toContain("Kill All");
+      setup.mockInput.pressKey("m");
+      await setup.renderOnce();
+      expect(setup.captureCharFrame()).not.toContain("Kill group");
+      expect(setup.captureCharFrame()).not.toContain("New session");
+      expect(setup.captureCharFrame()).not.toContain("Worktrees");
+      setup.mockInput.pressEnter();
+      setup.mockInput.pressKey(" ");
+      await setup.renderOnce();
+      frame = setup.captureCharFrame();
+      expect(frame).toContain("sessions (2)");
+      // Still expanded and still numbered from the band on.
+      expect(frame).toMatch(/ 2 \S working/);
+      await Bun.sleep(350);
+      expect(
+        uiStateWrites.some(
+          (u) => typeof u === "object" && u !== null && "collapsedGroups" in u,
+        ),
+      ).toBe(false);
+      expect(calls.some((c) => c.url.endsWith("/kill"))).toBe(false);
+    } finally {
+      restore();
+    }
+  });
+
+  it("collapse-all then x targets a real group instead of waiting sessions across repos", async () => {
+    const { calls, restore } = captureFetch();
+    try {
+      await renderApp(120, 24, { groupBy: "project" });
+      sseCallbacks!.onInit(
+        [
+          mockEnrichedSession({ id: "a", project: "alpha", status: "waiting" }),
+          mockEnrichedSession({ id: "b", project: "beta", status: "working" }),
+          mockEnrichedSession({
+            id: "c",
+            project: "charlie",
+            status: "waiting",
+          }),
+        ],
+        null,
+      );
+      await setup.renderOnce();
+      for (const key of ["G", "z", "m", "x"]) {
+        setup.mockInput.pressKey(key);
+        await setup.renderOnce();
+      }
+      expect(setup.captureCharFrame()).toContain("Kill Group?");
+      setup.mockInput.pressKey("y");
+      await setup.renderOnce();
+      expect(
+        calls
+          .filter((c) => c.url.endsWith("/kill"))
+          .map((c) => c.url.split("/sessions/")[1]),
+      ).toEqual(["b/kill"]);
     } finally {
       restore();
     }
@@ -7418,10 +7602,19 @@ describe("App hand off to", () => {
     });
     try {
       await renderRows([{}, { status: "waiting" }]);
+      // Skip the band header, the target row, and the `sessions` header that
+      // ends the band, to keep s1 as the source.
+      await press("j");
+      await press("j");
+      await press("j");
       await sendPick();
       const frame = squish(setup.captureCharFrame());
       expect(frame).toContain("Handoffrefused:");
-      expect(frame).toContain("Sessions2hasapendingprompt");
+      expect(frame).toContain("Sessions2hasa");
+      // Matched per wrapped line: the toast overlays the list, so a row drawn
+      // left of its second line lands between the two halves once squished.
+      expect(frame).toContain("pendingprompt.Ahandoffisnever");
+      expect(frame).toContain("usedtoanswerone");
     } finally {
       restore();
     }
@@ -7570,9 +7763,7 @@ describe("App worktrees panel (W)", () => {
             }
           : url.includes("/prs")
             ? {
-                repos: [
-                  { repoRoot: "/code/myapp", repoName: "myapp", prs },
-                ],
+                repos: [{ repoRoot: "/code/myapp", repoName: "myapp", prs }],
                 errors: [],
               }
             : {};
@@ -8380,6 +8571,94 @@ describe("App worktrees panel (W)", () => {
       expect(switchToPaneSpy.mock.calls[0]?.[0]).toBe("%9");
     } finally {
       restoreExit();
+      restore();
+    }
+  });
+});
+
+/**
+ * The counts scope is the one place a list prop must NOT be the filtered
+ * list: every change to it aborts an in-flight read and costs a
+ * `git worktree list` per repo on the daemon. `SessionList` owns the memo,
+ * but only App decides what it is handed, so the guard lives here.
+ */
+describe("App worktree counts scope", () => {
+  function mockCountsFetch() {
+    const originalFetch = globalThis.fetch;
+    const requests: URL[] = [];
+    globalThis.fetch = ((input: string | URL | Request) => {
+      const url = new URL(
+        input instanceof Request ? input.url : input.toString(),
+      );
+      if (url.pathname !== "/worktrees/counts")
+        return Promise.resolve(Response.json({}));
+      requests.push(url);
+      return Promise.resolve(
+        Response.json({
+          repos: url.searchParams
+            .getAll("repo")
+            .map((repoRoot) => ({ repoRoot, hasMain: true, linked: 2 })),
+        }),
+      );
+    }) as unknown as typeof fetch;
+    return {
+      requests,
+      restore: () => {
+        globalThis.fetch = originalFetch;
+      },
+    };
+  }
+
+  it("does not refetch counts while a search or hide-idle narrows the list", async () => {
+    const { requests, restore } = mockCountsFetch();
+    try {
+      await renderApp(120, 20, { groupBy: "project" });
+      sseCallbacks!.onConnectionStateChange?.("connected");
+      sseCallbacks!.onInit(
+        [
+          mockEnrichedSession({
+            id: "s1",
+            project: "alpha",
+            cwd: "/code/alpha",
+            mainRepoRoot: "/code/alpha",
+            status: "idle",
+          }),
+          mockEnrichedSession({
+            id: "s2",
+            project: "beta",
+            cwd: "/code/beta",
+            mainRepoRoot: "/code/beta",
+            status: "waiting",
+          }),
+        ],
+        null,
+      );
+      await setup.renderOnce();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await setup.renderOnce();
+      expect(requests).toHaveLength(1);
+      expect(requests[0]!.searchParams.getAll("repo")).toEqual([
+        "/code/alpha",
+        "/code/beta",
+      ]);
+
+      // hide-idle drops the alpha row, leaving one of the two repos with
+      // nothing visible.
+      setup.mockInput.pressKey("f");
+      await setup.renderOnce();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await setup.renderOnce();
+      expect(requests).toHaveLength(1);
+
+      // A query that matches only beta narrows it again.
+      setup.mockInput.pressKey("/");
+      await setup.renderOnce();
+      await setup.mockInput.typeText("beta");
+      await setup.renderOnce();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await setup.renderOnce();
+      expect(requests).toHaveLength(1);
+    } finally {
       restore();
     }
   });
