@@ -12,6 +12,8 @@ import {
   OPENCODE_PLUGIN_FILE,
 } from "../../../lib/config";
 import pkg from "../../../../package.json" with { type: "json" };
+import { BUILTIN_AGENTS, parseMajorVersion } from "../../../lib/agents";
+import { VersionResolver } from "../../version-resolver";
 import { aggregateOpenCodeMarkers } from "./aggregate";
 import {
   findPaneTrackedSession,
@@ -29,6 +31,19 @@ const CCMUX_VERSION: string = pkg.version;
 
 const SENTINEL_PREFIX = "// ccmux-plugin v";
 const SENTINEL_REGEX = /^\/\/ ccmux-plugin v(\S+)/;
+
+/** Where OpenCode 2 support is tracked; setup output points users at it. */
+const OPENCODE_V2_ISSUE = "https://github.com/epilande/ccmux/issues/214";
+
+/** `opencode --version` from PATH: `1.18.34` on 1.x, `opencode v2.0.21` on 2.x. */
+async function readInstalledOpenCodeVersion(): Promise<string | null> {
+  const agent = BUILTIN_AGENTS.find((a) => a.name === "opencode");
+  if (!agent) return null;
+  return new VersionResolver({ timeoutMs: 3000 }).resolve(
+    agent,
+    agent.executable ?? agent.name,
+  );
+}
 
 function inspectInstalledPlugin(path: string): {
   exists: boolean;
@@ -64,10 +79,32 @@ function inspectInstalledPlugin(path: string): {
 export class OpenCodePluginAdapter implements HookAdapter {
   readonly agentType = "opencode";
 
+  private readonly readOpenCodeVersion: () => Promise<string | null>;
+
+  constructor(
+    options: {
+      /** Version string of the `opencode` on PATH, or null if it cannot be run. */
+      readOpenCodeVersion?: () => Promise<string | null>;
+    } = {},
+  ) {
+    this.readOpenCodeVersion =
+      options.readOpenCodeVersion ?? readInstalledOpenCodeVersion;
+  }
+
+  /** The installed OpenCode's version when it is 2.x or newer, else null. */
+  private async detectOpenCode2(): Promise<string | null> {
+    const version = await this.readOpenCodeVersion().catch(() => null);
+    const major = parseMajorVersion(version);
+    return major !== null && major >= 2 ? version : null;
+  }
+
   async install(): Promise<HookAdapterOutcome> {
     const lines: string[] = [];
 
     const inspection = inspectInstalledPlugin(OPENCODE_PLUGIN_FILE);
+    const v2Version = await this.detectOpenCode2();
+    if (v2Version) return this.retireForOpenCode2(v2Version, inspection);
+
     if (inspection.exists && !inspection.owned) {
       // Matches Codex's "advisory, keep going" posture so a combined
       // `ccmux setup` invocation can still install Claude/Codex hooks.
@@ -98,6 +135,40 @@ export class OpenCodePluginAdapter implements HookAdapter {
     lines.push("OpenCode will auto-discover the plugin on next launch.");
     lines.push("Restart any running OpenCode sessions to pick up the plugin.");
     return { lines, changed: true };
+  }
+
+  /**
+   * OpenCode 2 rejects the plugin outright ("Plugin must export a default
+   * definition with an id and an effect or setup function"), and a port would
+   * not help: its plugins run in one shared background service outside every
+   * tmux pane, so a marker's pid could not locate a pane. Setup therefore
+   * installs nothing and removes a copy it wrote earlier, which would
+   * otherwise raise a load error on every OpenCode launch. A same-named file
+   * ccmux did not write is left alone.
+   */
+  private retireForOpenCode2(
+    version: string,
+    inspection: ReturnType<typeof inspectInstalledPlugin>,
+  ): HookAdapterOutcome {
+    const lines = [
+      `OpenCode ${version} does not support ccmux's plugin yet, so none was installed.`,
+    ];
+    let changed = false;
+    if (inspection.owned) {
+      unlinkSync(OPENCODE_PLUGIN_FILE);
+      changed = true;
+      lines.push(
+        `Removed ${OPENCODE_PLUGIN_FILE}, which OpenCode ${version} rejects at startup.`,
+      );
+    } else if (inspection.exists) {
+      lines.push(
+        `Left ${OPENCODE_PLUGIN_FILE} alone: first line does not start with "${SENTINEL_PREFIX}".`,
+      );
+    }
+    lines.push(
+      `OpenCode rows still track panes, with status read from the terminal. See ${OPENCODE_V2_ISSUE}`,
+    );
+    return { lines, changed };
   }
 
   async uninstall(): Promise<HookAdapterOutcome> {
@@ -134,9 +205,16 @@ export class OpenCodePluginAdapter implements HookAdapter {
       : `(plugin v${inspection.version})`;
   }
 
-  describeInstallAnomalies(): string[] {
+  async describeInstallAnomalies(): Promise<string[]> {
     const inspection = inspectInstalledPlugin(OPENCODE_PLUGIN_FILE);
     if (!inspection.owned) return [];
+    const v2Version = await this.detectOpenCode2();
+    if (v2Version) {
+      return [
+        `OpenCode: plugin at ${OPENCODE_PLUGIN_FILE} is installed, but OpenCode ${v2Version} rejects it at startup. ` +
+          "Run `ccmux setup --agent opencode` to remove it.",
+      ];
+    }
     if (inspection.version && inspection.version !== CCMUX_VERSION) {
       return [
         `OpenCode: plugin at ${OPENCODE_PLUGIN_FILE} is v${inspection.version} but ccmux is v${CCMUX_VERSION}. ` +

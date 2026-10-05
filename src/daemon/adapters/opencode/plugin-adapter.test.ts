@@ -109,12 +109,17 @@ function makeCtx(
 
 describe("OpenCodePluginAdapter", () => {
   let adapter: OpenCodePluginAdapter;
+  // What the stubbed `opencode --version` probe reports; null = not runnable.
+  let openCodeVersion: string | null;
 
   beforeEach(() => {
     rmSync(tempRoot, { recursive: true, force: true });
     mkdirSync(tempRoot, { recursive: true });
     refreshMarkerCache();
-    adapter = new OpenCodePluginAdapter();
+    openCodeVersion = "1.18.34";
+    adapter = new OpenCodePluginAdapter({
+      readOpenCodeVersion: async () => openCodeVersion,
+    });
   });
 
   afterEach(() => {
@@ -157,6 +162,50 @@ describe("OpenCodePluginAdapter", () => {
       const body = readFileSync(opencodePluginFile, "utf-8");
       expect(body).toContain(`markersDir: ${JSON.stringify(markersDir)}`);
       expect(body).toContain(`version: "${CCMUX_VERSION}"`);
+    });
+
+    it("installs as before when the OpenCode version cannot be read", async () => {
+      openCodeVersion = null;
+      const { changed } = await adapter.install();
+      expect(changed).toBe(true);
+      expect(existsSync(opencodePluginFile)).toBe(true);
+    });
+
+    describe("on OpenCode 2", () => {
+      beforeEach(() => {
+        openCodeVersion = "2.0.21";
+      });
+
+      it("installs nothing and says why", async () => {
+        const { lines, changed } = await adapter.install();
+        expect(changed).toBe(false);
+        expect(existsSync(opencodePluginFile)).toBe(false);
+        expect(lines[0]).toContain("OpenCode 2.0.21");
+        expect(lines.some((l) => l.includes("issues/214"))).toBe(true);
+      });
+
+      it("removes a plugin ccmux installed under 1.x, which 2.x rejects", async () => {
+        openCodeVersion = "1.18.34";
+        await adapter.install();
+        expect(existsSync(opencodePluginFile)).toBe(true);
+
+        openCodeVersion = "2.0.21";
+        const { lines, changed } = await adapter.install();
+        expect(changed).toBe(true);
+        expect(existsSync(opencodePluginFile)).toBe(false);
+        expect(lines.some((l) => l.startsWith("Removed"))).toBe(true);
+      });
+
+      it("leaves a same-named file ccmux did not write", async () => {
+        mkdirSync(opencodePluginDir, { recursive: true });
+        writeFileSync(opencodePluginFile, "// user-authored plugin\n");
+        const { lines, changed } = await adapter.install();
+        expect(changed).toBe(false);
+        expect(readFileSync(opencodePluginFile, "utf-8")).toBe(
+          "// user-authored plugin\n",
+        );
+        expect(lines.some((l) => l.startsWith("Left"))).toBe(true);
+      });
     });
   });
 
@@ -203,7 +252,21 @@ describe("OpenCodePluginAdapter", () => {
 
     it("reports no anomaly when versions match", async () => {
       await adapter.install();
-      expect(adapter.describeInstallAnomalies()).toEqual([]);
+      expect(await adapter.describeInstallAnomalies()).toEqual([]);
+    });
+
+    it("flags an installed plugin once OpenCode is upgraded to 2.x", async () => {
+      await adapter.install();
+      openCodeVersion = "2.0.21";
+      const warnings = await adapter.describeInstallAnomalies();
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("OpenCode 2.0.21 rejects it");
+      expect(warnings[0]).toContain("ccmux setup --agent opencode");
+    });
+
+    it("reports nothing on 2.x when no plugin is installed", async () => {
+      openCodeVersion = "2.0.21";
+      expect(await adapter.describeInstallAnomalies()).toEqual([]);
     });
 
     it("reports version skew when the sentinel version disagrees", async () => {
@@ -212,16 +275,16 @@ describe("OpenCodePluginAdapter", () => {
         opencodePluginFile,
         `// ccmux-plugin v0.0.0-stale\n// body\n`,
       );
-      const warnings = adapter.describeInstallAnomalies();
+      const warnings = await adapter.describeInstallAnomalies();
       expect(warnings).toHaveLength(1);
       expect(warnings[0]).toContain("v0.0.0-stale");
       expect(warnings[0]).toContain(CCMUX_VERSION);
     });
 
-    it("reports no anomaly for a foreign (non-ccmux) file", () => {
+    it("reports no anomaly for a foreign (non-ccmux) file", async () => {
       mkdirSync(opencodePluginDir, { recursive: true });
       writeFileSync(opencodePluginFile, "// not ccmux\n");
-      expect(adapter.describeInstallAnomalies()).toEqual([]);
+      expect(await adapter.describeInstallAnomalies()).toEqual([]);
     });
   });
 
