@@ -350,10 +350,12 @@ spawn rather than guessing a flag, and you can teach it the right shape with
 `--model <name>` starts the agent on that model, passed through as the agent's
 own flag (`--model` for every built-in, read from each CLI's `--help`). An
 agent with no known flag, including a custom one, refuses the spawn; declare
-`modelFlag` in its config to teach it. A new window is named after the
-worktree when the spawn has one (`fix-flicker`, `issue-150-...`, `pr-154-...`)
-and after the agent otherwise, so a batch of spawns is tellable apart; the name
-pins tmux's `automatic-rename` off for that window.
+`modelFlag` in its config to teach it. OpenCode 2's TUI has no model flag and
+exits on `--model`, so pick its model with `/models` inside OpenCode. A new
+window is named after the worktree when the spawn has one (`fix-flicker`,
+`issue-150-...`, `pr-154-...`) and after the agent otherwise, so a batch of
+spawns is tellable apart; the name pins tmux's `automatic-rename` off for that
+window.
 
 `--worktree [name]` spawns the agent into a git worktree at
 `<main>/.claude/worktrees/<name>`, creating it first if it doesn't exist yet.
@@ -903,6 +905,8 @@ Uses OpenCode's plugin system rather than shell hooks. `ccmux setup --agent open
 - `session.deleted`: unlinks the marker
 
 Because one OpenCode server can host many sessions, the daemon folds all markers sharing a server PID into the single ccmux Session for the tmux pane that hosts the server. Status is worst-of (`waiting > working > idle`); `cwd` and `nativeSessionId` come from the newest-activity marker, while `pendingTool` and the attention indicator come from the newest-waiting marker.
+
+OpenCode 2 rejects that plugin and runs its sessions in a shared background service outside your panes, so setup also installs a TUI plugin at `~/.config/opencode/plugins/ccmux/tui.js`, which runs inside each pane's OpenCode and reports the session that pane is showing (OpenCode 1 ignores it). On 2.x, setup removes the 1.x plugin instead of installing it. Notification Approve/Deny buttons are not offered on OpenCode 2 yet.
 
 ### Pi / oh-my-pi
 
