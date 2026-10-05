@@ -58,7 +58,7 @@ It works with your existing tmux workflow. You don't change how you launch or ru
 ### Homebrew
 
 ```sh
-brew install epilande/tap/ccmux
+brew install ccmux
 ccmux setup
 ```
 
